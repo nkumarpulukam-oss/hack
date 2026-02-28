@@ -1,0 +1,119 @@
+version: "3.9"
+
+services:
+  # ─── PostgreSQL ───────────────────────────────
+  postgres:
+    image: postgres:15-alpine
+    container_name: gsp-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: greenuser
+      POSTGRES_PASSWORD: greenpass
+      POSTGRES_DB: greenskills
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U greenuser -d greenskills"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - gsp-net
+
+  # ─── Ollama (local LLM - offline) ────────────
+  ollama:
+    image: ollama/ollama:latest
+    container_name: gsp-ollama
+    restart: unless-stopped
+    volumes:
+      - ollama_data:/root/.ollama
+    ports:
+      - "11434:11434"
+    networks:
+      - gsp-net
+    # GPU support (uncomment if NVIDIA GPU available):
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+
+  # ─── Ollama model puller (runs once) ─────────
+  ollama-init:
+    image: curlimages/curl:latest
+    container_name: gsp-ollama-init
+    depends_on:
+      - ollama
+    networks:
+      - gsp-net
+    entrypoint: >
+      sh -c "
+        sleep 15 &&
+        curl -s -X POST http://ollama:11434/api/pull -d '{\"name\": \"llama3\"}' &&
+        echo 'Ollama model pulled successfully'
+      "
+    restart: "no"
+
+  # ─── FastAPI Backend ──────────────────────────
+  server:
+    build:
+      context: ./server
+      dockerfile: Dockerfile
+    container_name: gsp-server
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://greenuser:greenpass@postgres:5432/greenskills
+      JWT_SECRET: ${JWT_SECRET:-green-skills-jwt-secret-change-in-production}
+      JWT_EXPIRE_HOURS: 24
+      OLLAMA_HOST: http://ollama:11434
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - gsp-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ─── React Frontend (build + serve via nginx) ─
+  app:
+    build:
+      context: ./app
+      dockerfile: Dockerfile
+      args:
+        REACT_APP_API_URL: ""
+    container_name: gsp-app
+    restart: unless-stopped
+    depends_on:
+      - server
+    networks:
+      - gsp-net
+
+  # ─── Nginx reverse proxy ──────────────────────
+  nginx:
+    image: nginx:alpine
+    container_name: gsp-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+    depends_on:
+      - app
+      - server
+    networks:
+      - gsp-net
+
+volumes:
+  postgres_data:
+  ollama_data:
+
+networks:
+  gsp-net:
+    driver: bridge
